@@ -1,3 +1,5 @@
+import os
+
 from flask.app import Flask
 from starlette.testclient import TestClient
 
@@ -138,3 +140,16 @@ class TestDataSetupService(BaseTest):
 
         assert parent_message.process_model_identifiers == []
         assert child_message.process_model_identifiers == [process_model_id]
+
+    def test_copy_example_process_models_replaces_existing_directory(
+        self,
+        app: Flask,
+    ) -> None:
+        self.copy_example_process_models()
+        stale_file = os.path.join(app.config["SPIFFWORKFLOW_BACKEND_BPMN_SPEC_ABSOLUTE_DIR"], "stale.txt")
+        with open(stale_file, "w") as stale_handle:
+            stale_handle.write("stale")
+
+        self.copy_example_process_models()
+
+        assert not os.path.exists(stale_file)
