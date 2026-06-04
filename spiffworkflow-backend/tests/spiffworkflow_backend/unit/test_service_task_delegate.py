@@ -6,11 +6,13 @@ from unittest.mock import patch
 import pytest
 from flask.app import Flask
 from requests import Response
+from SpiffWorkflow.bpmn.exceptions import WorkflowTaskException  # type: ignore
 from SpiffWorkflow.util.task import TaskState  # type: ignore
 from spiffworkflow_connector_command.command_interface import CommandResponseDict
 from spiffworkflow_connector_command.command_interface import ConnectorProxyResponseDict
 from sqlalchemy import and_
 
+from spiffworkflow_backend.models.future_task import FutureTaskModel
 from spiffworkflow_backend.models.task import TaskModel  # noqa: F401
 from spiffworkflow_backend.models.task_definition import TaskDefinitionModel
 from spiffworkflow_backend.models.user import UserModel
@@ -578,6 +580,111 @@ class TestServiceTaskDelegate(BaseTest):
 
         process_instance = ProcessInstanceService().get_process_instance(process_instance.id)
         assert process_instance.status == "complete"
+
+    def test_complete_waiting_callback_schedules_retry_for_transient_error(
+        self, app: Flask, with_db_and_bpmn_file_cleanup: None, with_super_admin_user: UserModel
+    ) -> None:
+        process_model = load_test_spec(
+            process_model_id="test_group/service_task",
+            process_model_source_directory="service_task",
+            bpmn_file_name="service_task_retry.bpmn",
+        )
+        process_instance = self.create_process_instance_from_process_model(
+            process_model=process_model, user=with_super_admin_user
+        )
+        processor = ProcessInstanceProcessor(process_instance)
+
+        fake_now = 2_000_000_000
+        with (
+            patch("requests.post") as mock_post,
+            patch("spiffworkflow_backend.services.custom_service_task.time.time", return_value=fake_now),
+            patch("spiffworkflow_backend.services.workflow_execution_service.time.time", return_value=fake_now),
+            patch("celery.current_app.send_task"),
+        ):
+            mock_post.return_value.status_code = 202
+            mock_post.return_value.ok = True
+            mock_post.return_value.text = json.dumps({})
+            processor.do_engine_steps(save=True)
+
+            call_kwargs = mock_post.call_args.kwargs
+            task_guid = call_kwargs.get("json", {})["spiff__task_id"]
+
+            response_item = ServiceTaskService.complete_waiting_callback(
+                process_instance_id=process_instance.id,
+                task_guid=task_guid,
+                content={
+                    "command_response": {
+                        "body": {},
+                        "mimetype": "application/json",
+                        "http_status": 503,
+                    },
+                    "command_response_version": 2,
+                    "error": {
+                        "error_code": "ServiceTaskHttpError503",
+                        "message": "upstream unavailable",
+                    },
+                },
+                user=with_super_admin_user,
+            )
+
+        assert response_item.next_task is not None
+        assert TaskState.get_name(response_item.next_task.state) == "STARTED"
+
+        reloaded_instance = ProcessInstanceService().get_process_instance(process_instance.id)
+        reloaded_processor = ProcessInstanceProcessor(reloaded_instance)
+        task_uuid = str(response_item.next_task.id)
+        reloaded_task = reloaded_processor.bpmn_process_instance.get_task_from_id(response_item.next_task.id)
+
+        assert reloaded_task is not None
+        assert TaskState.get_name(reloaded_task.state) == "STARTED"
+        assert reloaded_task.internal_data.get("spiff__retries_attempted") == 0
+        assert reloaded_task.internal_data.get("spiff__retry_at") == fake_now + 3
+
+        future_task = FutureTaskModel.query.filter_by(guid=task_uuid).first()
+        assert future_task is not None
+        assert future_task.completed is False
+
+    def test_complete_waiting_callback_does_not_retry_on_non_transient_error(
+        self, app: Flask, with_db_and_bpmn_file_cleanup: None, with_super_admin_user: UserModel
+    ) -> None:
+        process_model = load_test_spec(
+            process_model_id="test_group/service_task",
+            process_model_source_directory="service_task",
+            bpmn_file_name="service_task_retry.bpmn",
+        )
+        process_instance = self.create_process_instance_from_process_model(
+            process_model=process_model, user=with_super_admin_user
+        )
+        processor = ProcessInstanceProcessor(process_instance)
+
+        with patch("requests.post") as mock_post:
+            mock_post.return_value.status_code = 202
+            mock_post.return_value.ok = True
+            mock_post.return_value.text = json.dumps({})
+            processor.do_engine_steps(save=True)
+
+        call_kwargs = mock_post.call_args.kwargs
+        task_guid = call_kwargs.get("json", {})["spiff__task_id"]
+
+        with pytest.raises(WorkflowTaskException) as exc_info:
+            ServiceTaskService.complete_waiting_callback(
+                process_instance_id=process_instance.id,
+                task_guid=task_guid,
+                content={
+                    "command_response": {
+                        "body": {},
+                        "mimetype": "application/json",
+                        "http_status": 400,
+                    },
+                    "command_response_version": 2,
+                    "error": {
+                        "error_code": "ServiceTaskHttpError400",
+                        "message": "bad request",
+                    },
+                },
+                user=with_super_admin_user,
+            )
+        assert "ServiceTaskHttpError400" in str(exc_info.value)
 
     def _assert_error_with_code(self, response_text: str, error_code: str, contains_message: str, status_code: int) -> None:
         assert f"'{error_code}'" in response_text
